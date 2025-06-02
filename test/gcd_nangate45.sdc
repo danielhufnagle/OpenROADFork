@@ -10,5 +10,3 @@ set_output_delay $output_delay -clock core_clock [all_outputs]
 
 # Set clock uncertainty (assume 10% of period)
 set_clock_uncertainty [expr 0.4850 * 0.1] core_clock
-
-//set_all_input_output_delays

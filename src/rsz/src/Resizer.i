@@ -789,6 +789,30 @@ void set_debug_cmd(const char* net_name,
   resizer->setDebugGraphics(std::move(graphics));
 }
 
+////////////////////////////////////////////////////////////////
+// Held's Fast Global Gate Sizing Algorithm
+
+bool
+optimize_gate_sizing_held_cmd(double clock_period,
+                          double gamma,
+                          double max_change,
+                          int max_iterations)
+{
+  ensureLinked();
+  Resizer *resizer = getResizer();
+  return resizer->optimizeGateSizingHeld(clock_period, gamma, max_change, max_iterations);
+}
+
+void
+set_held_sizing_parameters_cmd(double gamma,
+                           double max_change,
+                           int max_iterations)
+{
+  ensureLinked();
+  Resizer *resizer = getResizer();
+  resizer->setHeldSizingParameters(gamma, max_change, max_iterations);
+}
+
 } // namespace
 
 %} // inline

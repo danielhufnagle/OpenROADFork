@@ -11,6 +11,7 @@
 #include "db_sta/dbNetwork.hh"
 #include "db_sta/dbSta.hh"
 #include "dpl/Opendp.h"
+#include "grt/GlobalRouter.h"
 #include "rsz/OdbCallBack.hh"
 #include "sta/Path.hh"
 #include "sta/UnorderedSet.hh"
@@ -109,6 +110,7 @@ class RepairDesign;
 class RepairSetup;
 class RepairHold;
 class ResizerObserver;
+class HeldGateSizing;
 
 class CloneMove;
 class BufferMove;
@@ -429,6 +431,21 @@ class Resizer : public dbStaState, public dbNetworkObserver
   static MoveType parseMove(const std::string& s);
   static std::vector<MoveType> parseMoveSequence(const std::string& sequence);
 
+  // Resize drvr_pin instance to target cap ratio.
+  // Return 1 if resized.
+  int resizeToCapRatio(const Pin* drvr_pin, bool upsize_only);
+
+  ////////////////////////////////////////////////////////////////
+  // Held's fast global gate sizing algorithm
+  // Replaces the traditional slew-based gate sizing approach
+  bool optimizeGateSizingHeld(double clock_period,
+                              double gamma = 0.5,
+                              double max_change = 0.05,
+                              int max_iterations = 50);
+  void setHeldSizingParameters(double gamma, double max_change, int max_iterations);
+
+  ////////////////////////////////////////////////////////////////
+
  protected:
   void init();
   double computeDesignArea();
@@ -491,10 +508,6 @@ class Resizer : public dbStaState, public dbNetworkObserver
   // Resize drvr_pin instance to target slew.
   // Return 1 if resized.
   int resizeToTargetSlew(const Pin* drvr_pin);
-
-  // Resize drvr_pin instance to target cap ratio.
-  // Return 1 if resized.
-  int resizeToCapRatio(const Pin* drvr_pin, bool upsize_only);
 
   ////////////////////////////////////////////////////////////////
 
@@ -606,7 +619,7 @@ class Resizer : public dbStaState, public dbNetworkObserver
 
   void incrementalParasiticsBegin();
   void incrementalParasiticsEnd();
-  void ensureParasitics();
+  void ensureParasitics(bool save_guides = false);
   void updateParasitics(bool save_guides = false);
   void ensureWireParasitic(const Pin* drvr_pin);
   void ensureWireParasitic(const Pin* drvr_pin, const Net* net);
@@ -694,6 +707,7 @@ class Resizer : public dbStaState, public dbNetworkObserver
   RepairDesign* repair_design_;
   RepairSetup* repair_setup_;
   RepairHold* repair_hold_;
+  std::unique_ptr<HeldGateSizing> held_gate_sizing_;
   std::unique_ptr<AbstractSteinerRenderer> steiner_renderer_;
 
   // Layer RC per wire length indexed by layer->getNumber(), corner->index
@@ -820,6 +834,7 @@ class Resizer : public dbStaState, public dbNetworkObserver
   friend class RepairDesign;
   friend class RepairSetup;
   friend class RepairHold;
+  friend class HeldGateSizing;
   friend class SteinerTree;
   friend class BaseMove;
   friend class BufferMove;

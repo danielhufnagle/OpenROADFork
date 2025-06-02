@@ -20,6 +20,7 @@
 #include "BufferMove.hh"
 #include "BufferedNet.hh"
 #include "CloneMove.hh"
+#include "HeldGateSizing.hh"
 #include "RecoverPower.hh"
 #include "RepairDesign.hh"
 #include "RepairHold.hh"
@@ -137,6 +138,14 @@ Resizer::~Resizer()
   delete repair_design_;
   delete repair_setup_;
   delete repair_hold_;
+  delete target_load_map_;
+  delete incr_groute_;
+  delete buffer_move;
+  delete clone_move;
+  delete size_move;
+  delete split_load_move;
+  delete swap_pins_move;
+  delete unbuffer_move;
 }
 
 void Resizer::init(Logger* logger,
@@ -168,6 +177,9 @@ void Resizer::init(Logger* logger,
   split_load_move = new SplitLoadMove(this);
   swap_pins_move = new SwapPinsMove(this);
   unbuffer_move = new UnbufferMove(this);
+  
+  // Initialize Held gate sizing
+  held_gate_sizing_ = std::make_unique<HeldGateSizing>(this);
 }
 
 ////////////////////////////////////////////////////////////////
@@ -915,10 +927,8 @@ Instance* Resizer::bufferInput(const Pin* top_pin, LibertyCell* buffer_cell)
     if (pin != top_pin) {
       odb::dbBTerm* dest_bterm;
       odb::dbModITerm* dest_moditerm;
-      odb::dbModBTerm* dest_modbterm;
       odb::dbITerm* dest_iterm;
-      db_network_->staToDb(
-          pin, dest_iterm, dest_bterm, dest_moditerm, dest_modbterm);
+      db_network_->staToDb(pin, dest_iterm, dest_bterm, dest_moditerm);
       odb::dbModNet* dest_modnet = db_network_->hierNet(pin);
       sta_->disconnectPin(const_cast<Pin*>(pin));
       if (dest_modnet) {
@@ -1020,8 +1030,7 @@ bool Resizer::hasTristateOrDontTouchDriver(const Net* net)
       odb::dbITerm* iterm;
       odb::dbBTerm* bterm;
       odb::dbModITerm* moditerm;
-      odb::dbModBTerm* modbterm;
-      db_network_->staToDb(pin, iterm, bterm, moditerm, modbterm);
+      db_network_->staToDb(pin, iterm, bterm, moditerm);
       if (iterm && iterm->getInst()->isDoNotTouch()) {
         logger_->warn(RSZ,
                       84,
@@ -1049,13 +1058,9 @@ void Resizer::bufferOutput(const Pin* top_pin, LibertyCell* buffer_cell)
   odb::dbITerm* top_pin_op_iterm;
   odb::dbBTerm* top_pin_op_bterm;
   odb::dbModITerm* top_pin_op_moditerm;
-  odb::dbModBTerm* top_pin_op_modbterm;
 
-  db_network_->staToDb(top_pin,
-                       top_pin_op_iterm,
-                       top_pin_op_bterm,
-                       top_pin_op_moditerm,
-                       top_pin_op_modbterm);
+  db_network_->staToDb(
+      top_pin, top_pin_op_iterm, top_pin_op_bterm, top_pin_op_moditerm);
 
   odb::dbNet* flat_op_net = top_pin_op_bterm->getNet();
   odb::dbModNet* hier_op_net = top_pin_op_bterm->getModNet();
@@ -2009,7 +2014,7 @@ bool Resizer::replaceCell(Instance* inst,
 bool Resizer::hasMultipleOutputs(const Instance* inst)
 {
   int output_count = 0;
-  InstancePinIterator* pin_iter = network_->pinIterator(inst);
+  std::unique_ptr<InstancePinIterator> pin_iter(network_->pinIterator(inst));
   while (pin_iter->hasNext()) {
     const Pin* pin = pin_iter->next();
     if (network_->direction(pin)->isAnyOutput() && network_->net(pin)) {
@@ -4319,6 +4324,40 @@ std::vector<rsz::MoveType> Resizer::parseMoveSequence(
     result.push_back(parseMove(item));
   }
   return result;
+}
+
+////////////////////////////////////////////////////////////////
+// Held's fast global gate sizing algorithm implementation
+
+bool Resizer::optimizeGateSizingHeld(double clock_period,
+                                     double gamma,
+                                     double max_change,
+                                     int max_iterations) {
+  if (!held_gate_sizing_) {
+    logger_->error(RSZ, 119, "Held gate sizing not initialized");
+    return false;
+  }
+  
+  // Set parameters
+  held_gate_sizing_->setGamma(gamma);
+  held_gate_sizing_->setMaxChange(max_change);
+  held_gate_sizing_->setMaxIterations(max_iterations);
+  
+  // Run the optimization
+  return held_gate_sizing_->optimizeGateSizing(clock_period);
+}
+
+void Resizer::setHeldSizingParameters(double gamma, 
+                                      double max_change, 
+                                      int max_iterations) {
+  if (!held_gate_sizing_) {
+    logger_->error(RSZ, 120, "Held gate sizing not initialized");
+    return;
+  }
+  
+  held_gate_sizing_->setGamma(gamma);
+  held_gate_sizing_->setMaxChange(max_change);
+  held_gate_sizing_->setMaxIterations(max_iterations);
 }
 
 }  // namespace rsz

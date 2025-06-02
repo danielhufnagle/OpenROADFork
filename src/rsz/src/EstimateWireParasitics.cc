@@ -236,7 +236,7 @@ double Resizer::wireClkVCapacitance(const Corner* corner) const
 
 ////////////////////////////////////////////////////////////////
 
-void Resizer::ensureParasitics()
+void Resizer::ensureParasitics(bool save_guides)
 {
   estimateParasitics(global_router_->haveRoutes()
                          ? ParasiticsSrc::global_routing

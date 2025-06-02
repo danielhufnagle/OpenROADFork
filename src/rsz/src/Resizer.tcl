@@ -1118,5 +1118,94 @@ proc set_dbvia_wire_r { layer res } {
   $layer setResistance $res
 }
 
+################################################################
+# Held's Fast Global Gate Sizing Algorithm
+
+sta::define_cmd_args "optimize_gate_sizing_held" { \
+  clock_period \
+  [-gamma gamma] \
+  [-max_change max_change] \
+  [-max_iterations max_iterations] }
+
+proc optimize_gate_sizing_held { args } {
+  sta::parse_key_args "optimize_gate_sizing_held" args \
+    keys {-gamma -max_change -max_iterations} \
+    flags {}
+
+  set argc [llength $args]
+  if { $argc != 1 } {
+    utl::error RSZ 109 "optimize_gate_sizing_held clock_period"
+  }
+
+  set clock_period [lindex $args 0]
+  sta::check_positive_float "clock_period" $clock_period
+  set clock_period_sta [sta::time_ui_sta $clock_period]
+
+  # Set default parameters
+  set gamma 0.5
+  set max_change 0.05  
+  set max_iterations 50
+
+  if { [info exists keys(-gamma)] } {
+    set gamma $keys(-gamma)
+    sta::check_positive_float "-gamma" $gamma
+  }
+
+  if { [info exists keys(-max_change)] } {
+    set max_change $keys(-max_change)
+    sta::check_positive_float "-max_change" $max_change
+  }
+
+  if { [info exists keys(-max_iterations)] } {
+    set max_iterations $keys(-max_iterations)
+    sta::check_positive_integer "-max_iterations" $max_iterations
+  }
+
+  rsz::check_parasitics
+  set improved [::rsz::optimize_gate_sizing_held_cmd $clock_period_sta $gamma $max_change $max_iterations]
+  
+  if { $improved } {
+    utl::info RSZ 110 "Held gate sizing optimization completed successfully."
+  } else {
+    utl::warn RSZ 111 "Held gate sizing optimization did not improve the design."
+  }
+  
+  return $improved
+}
+
+sta::define_cmd_args "set_held_sizing_parameters" { \
+  [-gamma gamma] \
+  [-max_change max_change] \
+  [-max_iterations max_iterations] }
+
+proc set_held_sizing_parameters { args } {
+  sta::parse_key_args "set_held_sizing_parameters" args \
+    keys {-gamma -max_change -max_iterations} \
+    flags {}
+
+  # Default values
+  set gamma 0.5
+  set max_change 0.05
+  set max_iterations 50
+
+  if { [info exists keys(-gamma)] } {
+    set gamma $keys(-gamma)
+    sta::check_positive_float "-gamma" $gamma
+  }
+
+  if { [info exists keys(-max_change)] } {
+    set max_change $keys(-max_change)
+    sta::check_positive_float "-max_change" $max_change
+  }
+
+  if { [info exists keys(-max_iterations)] } {
+    set max_iterations $keys(-max_iterations)
+    sta::check_positive_integer "-max_iterations" $max_iterations
+  }
+
+  ::rsz::set_held_sizing_parameters_cmd $gamma $max_change $max_iterations
+  utl::info RSZ 113 "Held sizing parameters set: gamma=$gamma, max_change=$max_change, max_iterations=$max_iterations"
+}
+
 # namespace
 }

@@ -928,7 +928,8 @@ Instance* Resizer::bufferInput(const Pin* top_pin, LibertyCell* buffer_cell)
       odb::dbBTerm* dest_bterm;
       odb::dbModITerm* dest_moditerm;
       odb::dbITerm* dest_iterm;
-      db_network_->staToDb(pin, dest_iterm, dest_bterm, dest_moditerm);
+      odb::dbModBTerm* dest_modbterm;
+      db_network_->staToDb(pin, dest_iterm, dest_bterm, dest_moditerm, dest_modbterm);
       odb::dbModNet* dest_modnet = db_network_->hierNet(pin);
       sta_->disconnectPin(const_cast<Pin*>(pin));
       if (dest_modnet) {
@@ -1030,7 +1031,8 @@ bool Resizer::hasTristateOrDontTouchDriver(const Net* net)
       odb::dbITerm* iterm;
       odb::dbBTerm* bterm;
       odb::dbModITerm* moditerm;
-      db_network_->staToDb(pin, iterm, bterm, moditerm);
+      odb::dbModBTerm* modbterm;
+      db_network_->staToDb(pin, iterm, bterm, moditerm, modbterm);
       if (iterm && iterm->getInst()->isDoNotTouch()) {
         logger_->warn(RSZ,
                       84,
@@ -1058,9 +1060,10 @@ void Resizer::bufferOutput(const Pin* top_pin, LibertyCell* buffer_cell)
   odb::dbITerm* top_pin_op_iterm;
   odb::dbBTerm* top_pin_op_bterm;
   odb::dbModITerm* top_pin_op_moditerm;
+  odb::dbModBTerm* top_pin_op_modbterm;
 
   db_network_->staToDb(
-      top_pin, top_pin_op_iterm, top_pin_op_bterm, top_pin_op_moditerm);
+      top_pin, top_pin_op_iterm, top_pin_op_bterm, top_pin_op_moditerm, top_pin_op_modbterm);
 
   odb::dbNet* flat_op_net = top_pin_op_bterm->getNet();
   odb::dbModNet* hier_op_net = top_pin_op_bterm->getModNet();

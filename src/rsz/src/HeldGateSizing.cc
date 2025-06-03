@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <queue>
 
 #include "rsz/Resizer.hh"
 #include "sta/Corner.hh"
@@ -50,15 +51,18 @@ HeldGateSizing::HeldGateSizing(Resizer* resizer,
       gamma_(gamma),
       max_change_(max_change),
       max_iterations_(max_iterations),
+      log_constant_(2.0), // Held's default
       iteration_(0),
       endpoints_count_(0),
-      best_objective_(numeric_limits<double>::infinity()),
-      worst_slack_prev_(numeric_limits<double>::infinity()),
-      objective_prev_(numeric_limits<double>::infinity()),
-      default_max_slew_(0.5e-9),  // 500ps - more realistic
-      default_min_slew_(10e-12),  // 10ps - reasonable minimum
-      default_input_slew_(50e-12), // 50ps - reasonable default
-      wire_slew_degrade_factor_(0.05), // Reduced from 0.1
+      best_ws_(numeric_limits<double>::infinity()),
+      best_sns_(numeric_limits<double>::infinity()),
+      best_avg_area_(numeric_limits<double>::infinity()),
+      prev_ws_(numeric_limits<double>::infinity()),
+      prev_sns_(numeric_limits<double>::infinity()),
+      prev_avg_area_(numeric_limits<double>::infinity()),
+      default_max_slew_(0.5e-9),  // 500ps
+      default_min_slew_(10e-12),  // 10ps
+      default_input_slew_(50e-12), // 50ps
       corner_(nullptr),
       dcalc_ap_(nullptr) {
 }
@@ -66,10 +70,9 @@ HeldGateSizing::HeldGateSizing(Resizer* resizer,
 bool HeldGateSizing::optimizeGateSizing(double clock_period) {
   clock_period_ = clock_period;
   
-  // Find the slowest corner for sizing (similar to existing resizer logic)
+  // Find the slowest corner for sizing
   corner_ = resizer_->tgt_slew_corner_;
   if (!corner_) {
-    // If no target slew corner, use the first available corner
     for (Corner* corner : *sta_->corners()) {
       corner_ = corner;
       break;
@@ -77,7 +80,6 @@ bool HeldGateSizing::optimizeGateSizing(double clock_period) {
   }
   
   if (!corner_) {
-    // As last resort, create a default corner
     corner_ = sta_->findCorner("default");
     if (!corner_) {
       logger_->warn(RSZ, 100, "No timing corner found for gate sizing");
@@ -93,86 +95,78 @@ bool HeldGateSizing::optimizeGateSizing(double clock_period) {
   
   logger_->info(RSZ, 101, "Starting Held's gate sizing algorithm");
   
-  // Initialize the algorithm
+  // Held's Algorithm 1, Line 1: Initialize slew targets
   buildCellInfoMap();
-  computeTopologicalLevels();
+  buildCellGraph(); 
+  computeLongestDistanceFromRegisters();
   initializeSlewTargets();
   
   // Save initial state as best
   saveCurrentAssignmentAsBest();
   
-  // Main optimization loop
+  // Held's Algorithm 1, Lines 2-6: Main optimization loop
   bool improved = false;
-  int stagnation_count = 0;
-  const int max_stagnation = 3; // Stop if no improvement for 3 iterations
   
   for (iteration_ = 1; iteration_ <= max_iterations_; ++iteration_) {
     logger_->info(RSZ, 114, "Held sizing iteration {}", iteration_);
     
-    // Step 1: Assign cells to meet slew targets (reverse topological order)
+    // Held's Algorithm 1, Line 3: Assign cells to library cells
     assignCellsToMeetSlewTargets();
     
-    // Step 2: Perform timing analysis
+    // Held's Algorithm 1, Line 4: Timing analysis
     performTimingAnalysis();
     
-    // Step 3: Evaluate current solution
-    double curr_worst_slack = computeWorstSlack();
-    double curr_objective = computeObjective();
+    // Evaluate current solution using Held's metrics
+    double curr_ws = abs(computeWorstSlack());
+    double curr_sns = computeTotalNegativeSlack() / std::max(1.0, (double)endpoints_count_);
+    double curr_avg_area = computeAverageCellArea();
     
     logger_->info(RSZ, 115, 
-                 "Iteration {} - WNS: {:.3f} ps, Objective: {:.6f}",
+                 "Iteration {} - WS: {:.3f} ps, SNS: {:.3f} ps, Area: {:.3f}",
                  iteration_, 
-                 curr_worst_slack * 1e12,
-                 curr_objective);
+                 curr_ws * 1e12,
+                 curr_sns * 1e12,
+                 curr_avg_area);
     
-    // Check if this is the best solution so far
-    if (curr_objective < best_objective_ - 1e-6) { // Small improvement threshold
-      best_objective_ = curr_objective;
+    // Check if this is the best solution so far (Held's objective: WS + SNS + area)
+    double curr_held_obj = curr_ws + curr_sns + curr_avg_area;
+    double best_held_obj = best_ws_ + best_sns_ + best_avg_area_;
+    
+    if (curr_held_obj < best_held_obj) {
+      best_ws_ = curr_ws;
+      best_sns_ = curr_sns;
+      best_avg_area_ = curr_avg_area;
       saveCurrentAssignmentAsBest();
       improved = true;
-      stagnation_count = 0; // Reset stagnation counter
-    } else {
-      stagnation_count++;
     }
     
-    // Step 4: Check stopping criteria
+    // Held's stopping criterion: Check if WS worsened AND overall objective worsened
     if (iteration_ > 1) {
-      // Check if algorithm is stagnating
-      if (stagnation_count >= max_stagnation) {
-        logger_->info(RSZ, 122, 
-                     "Stopping - no improvement for {} iterations", 
-                     max_stagnation);
-        break;
-      }
-      
-      // Check if the algorithm is diverging
-      if (curr_worst_slack < worst_slack_prev_ && curr_objective > objective_prev_) {
-        // WNS worsened and objective got worse - revert and stop
+      if (checkHeldStoppingCriterion(prev_ws_, prev_sns_, prev_avg_area_)) {
+        logger_->info(RSZ, 122, "Held stopping criterion met - restoring best solution");
         restoreBestAssignment();
-        logger_->info(RSZ, 123, 
-                     "Stopping - reverted to best solution at iteration {}",
-                     iteration_);
         break;
       }
       
-      // Check for numerical convergence
-      if (iteration_ > 2 && 
-          abs(curr_worst_slack - worst_slack_prev_) < 1e-12 &&
-          abs(curr_objective - objective_prev_) < 1e-9) {
-        logger_->info(RSZ, 124, "Stopping - numerical convergence achieved");
+      // Additional numerical convergence check
+      if (abs(curr_ws - prev_ws_) < 1e-12 && 
+          abs(curr_sns - prev_sns_) < 1e-12 && 
+          abs(curr_avg_area - prev_avg_area_) < 1e-6) {
+        logger_->info(RSZ, 124, "Numerical convergence achieved");
         break;
       }
     }
     
-    // Store current metrics for next iteration comparison
-    worst_slack_prev_ = curr_worst_slack;
-    objective_prev_ = curr_objective;
+    // Store current metrics for next iteration
+    prev_ws_ = curr_ws;
+    prev_sns_ = curr_sns;
+    prev_avg_area_ = curr_avg_area;
     
-    // Step 5: Refine slew targets based on criticalities
+    // Held's Algorithm 1, Line 5: Refine slew targets
     refineSlewTargets();
   }
   
-  // Report final results
+  // Held's Algorithm 1, Line 7: Return best assignment (already restored if needed)
   double final_wns = computeWorstSlack();
   double final_tns = computeTotalNegativeSlack();
   double final_area = computeAverageCellArea();
@@ -193,7 +187,6 @@ void HeldGateSizing::buildCellInfoMap() {
   
   int total_instances = 0;
   int sizeable_instances = 0;
-  int multi_variant_instances = 0;
   
   // Iterate through all instances in the design
   sta::LeafInstanceIterator* inst_iter = network_->leafInstanceIterator();
@@ -216,13 +209,10 @@ void HeldGateSizing::buildCellInfoMap() {
     cell_info.is_fixed = cell->hasSequentials(); // Registers are fixed
     cell_info.current_variant_idx = 0;
     cell_info.distance_from_src = 0.0;
+    cell_info.slack_minus = 0.0;
     
-    // Get equivalent cells (swappable variants)
+    // Get equivalent cells (swappable variants) - Held's [c]
     cell_info.variants = getEquivalentCells(inst);
-    
-    if (cell_info.variants.size() > 1) {
-      multi_variant_instances++;
-    }
     
     // Find current variant index
     for (size_t i = 0; i < cell_info.variants.size(); ++i) {
@@ -232,7 +222,7 @@ void HeldGateSizing::buildCellInfoMap() {
       }
     }
     
-    // Initialize output pin data (assume single output for simplicity)
+    // Initialize output pin data
     InstancePinIterator* pin_iter = network_->pinIterator(inst);
     while (pin_iter->hasNext()) {
       Pin* pin = pin_iter->next();
@@ -241,6 +231,8 @@ void HeldGateSizing::buildCellInfoMap() {
         cell_info.output.slew_target = default_max_slew_;
         cell_info.output.wire_cap = 0.0;
         cell_info.output.downstream_cap = 0.0;
+        cell_info.output.slew_limit_from_sinks = default_max_slew_;
+        cell_info.output.min_achievable_slew = default_min_slew_;
         
         // Collect sink pins
         PinConnectedPinIterator* conn_iter = network_->connectedPinIterator(pin);
@@ -251,7 +243,7 @@ void HeldGateSizing::buildCellInfoMap() {
           }
         }
         delete conn_iter;
-        break; // Assume single output
+        break; // Assume single output for simplicity
       } else if (network_->direction(pin)->isInput()) {
         cell_info.input_pins.push_back(pin);
       }
@@ -262,8 +254,8 @@ void HeldGateSizing::buildCellInfoMap() {
   }
   delete inst_iter;
   
-  logger_->info(RSZ, 118, "Built cell info map: {} total instances, {} sizeable, {} with multiple variants", 
-               total_instances, sizeable_instances, multi_variant_instances);
+  logger_->info(RSZ, 118, "Built cell info map: {} total instances, {} sizeable", 
+               total_instances, sizeable_instances);
 }
 
 std::vector<LibertyCell*> HeldGateSizing::getEquivalentCells(Instance* inst) {
@@ -274,7 +266,7 @@ std::vector<LibertyCell*> HeldGateSizing::getEquivalentCells(Instance* inst) {
   LibertyCellSeq equiv_cells = resizer_->getSwappableCells(cell);
   std::vector<LibertyCell*> result(equiv_cells.begin(), equiv_cells.end());
   
-  // Sort by drive strength (area as proxy)
+  // Held requires sorting by area (smallest first for greedy selection)
   std::sort(result.begin(), result.end(), 
            [](const LibertyCell* a, const LibertyCell* b) {
              return a->area() < b->area();
@@ -283,199 +275,230 @@ std::vector<LibertyCell*> HeldGateSizing::getEquivalentCells(Instance* inst) {
   return result;
 }
 
-void HeldGateSizing::computeTopologicalLevels() {
-  // Use OpenROAD's existing level computation infrastructure
-  resizer_->ensureLevelDrvrVertices();
+void HeldGateSizing::buildCellGraph() {
+  // Build cell-to-cell adjacency for topological ordering
+  cell_graph_.clear();
+  cell_preds_.clear();
   
-  // Convert to our data structure and sort
+  for (auto& [inst, cell_info] : cell_info_map_) {
+    cell_graph_[inst] = std::vector<Instance*>();
+    cell_preds_[inst] = std::vector<Instance*>();
+  }
+  
+  // Build edges: if cell A's output drives cell B's input, add A->B edge
+  for (auto& [inst, cell_info] : cell_info_map_) {
+    if (cell_info.output.pin) {
+      for (Pin* sink_pin : cell_info.output.sinks) {
+        Instance* sink_inst = network_->instance(sink_pin);
+        if (cell_info_map_.find(sink_inst) != cell_info_map_.end()) {
+          // Add edge inst -> sink_inst
+          cell_graph_[inst].push_back(sink_inst);
+          cell_preds_[sink_inst].push_back(inst);
+        }
+      }
+    }
+  }
+}
+
+void HeldGateSizing::computeLongestDistanceFromRegisters() {
+  // Held's requirement: "longest distance (under unit edge lengths) from a register"
+  // Initialize all distances to 0
+  for (auto& [inst, cell_info] : cell_info_map_) {
+    cell_info.distance_from_src = 0.0;
+  }
+  
+  // Start BFS/DP from all register outputs (fixed cells)
+  std::queue<Instance*> queue;
+  std::unordered_map<Instance*, double> distances;
+  std::unordered_map<Instance*, int> visit_count; // Prevent infinite loops
+  
+  // Initialize: all registers have distance 0
+  for (auto& [inst, cell_info] : cell_info_map_) {
+    if (cell_info.is_fixed) {
+      distances[inst] = 0.0;
+      visit_count[inst] = 0;
+      queue.push(inst);
+    } else {
+      distances[inst] = -1.0; // unvisited
+      visit_count[inst] = 0;
+    }
+  }
+  
+  // BFS to find longest distance (unit edge weights) with cycle protection
+  const int MAX_VISITS = 1000; // Prevent infinite loops
+  const double MAX_DISTANCE = 100.0; // Reasonable upper bound for circuit depth
+  
+  while (!queue.empty()) {
+    Instance* current = queue.front();
+    queue.pop();
+    
+    // Prevent infinite loops - if a node is visited too many times, skip it
+    if (visit_count[current] > MAX_VISITS) {
+      logger_->warn(RSZ, 132, "Potential cycle detected in cell graph, limiting distance computation");
+      continue;
+    }
+    visit_count[current]++;
+    
+    double current_dist = distances[current];
+    
+    // Sanity check - prevent distance from growing too large
+    if (current_dist > MAX_DISTANCE) {
+      continue;
+    }
+    
+    // Update all successors
+    for (Instance* successor : cell_graph_[current]) {
+      double new_dist = current_dist + 1.0;
+      
+      // Only update if we found a genuinely longer path and haven't exceeded limits
+      if (distances[successor] < new_dist && new_dist <= MAX_DISTANCE && visit_count[successor] <= MAX_VISITS) {
+        distances[successor] = new_dist;
+        queue.push(successor);
+      }
+    }
+  }
+  
+  // Copy back to cell_info and sort
   topo_sorted_cells_.clear();
   for (auto& [inst, cell_info] : cell_info_map_) {
-    // Find the instance's driver vertex to get its level
-    Pin* drvr_pin = cell_info.output.pin;
-    if (drvr_pin) {
-      sta::Vertex* vertex = resizer_->graph_->pinDrvrVertex(drvr_pin);
-      if (vertex) {
-        cell_info.distance_from_src = vertex->level();
-      }
+    cell_info.distance_from_src = distances[inst];
+    if (distances[inst] < 0) {
+      // Unreachable from registers - assign large distance
+      cell_info.distance_from_src = 1000.0;
     }
     topo_sorted_cells_.push_back(&cell_info);
   }
   
-  // Sort by topological level (distance from source)
+  // Sort by distance (ascending) - we'll process in reverse order (decreasing distance)
   std::sort(topo_sorted_cells_.begin(), topo_sorted_cells_.end(),
            [](const HeldCellInfo* a, const HeldCellInfo* b) {
              return a->distance_from_src < b->distance_from_src;
            });
+           
+  logger_->info(RSZ, 123, "Computed longest distances: max_distance={:.1f}", 
+                topo_sorted_cells_.empty() ? 0.0 : topo_sorted_cells_.back()->distance_from_src);
 }
 
 void HeldGateSizing::initializeSlewTargets() {
-  // Initialize slew targets based on actual constraints and technology characteristics
+  // Held's specification: "Initialize slew targets for all cell output pins such that 
+  // the slew limits will just be met at subsequent sinks (accounting for the slew 
+  // degradations on the wires)"
+  
   for (auto& [inst, cell_info] : cell_info_map_) {
     if (cell_info.output.pin) {
-      double min_sink_limit = default_max_slew_;
+      // Compute slew_limit_from_sinks = min over sinks of (slewlim(q) - degradation(p->q))
+      double min_sink_limit = std::numeric_limits<double>::infinity();
+      bool any_sink_has_limit = false;
       
-      // Find minimum slew limit among all sinks
-      bool found_constraint = false;
       for (Pin* sink_pin : cell_info.output.sinks) {
         LibertyPort* sink_port = network_->libertyPort(sink_pin);
         if (sink_port) {
-          float slew_limit;
+          float sink_slew_limit;
           bool exists;
-          sta_->findSlewLimit(sink_port, corner_, MinMax::max(), slew_limit, exists);
-          if (exists && slew_limit > 0) {
-            min_sink_limit = min(min_sink_limit, (double)slew_limit);
-            found_constraint = true;
+          sta_->findSlewLimit(sink_port, corner_, MinMax::max(), sink_slew_limit, exists);
+          if (exists && sink_slew_limit > 0) {
+            any_sink_has_limit = true;
+            // Account for wire degradation
+            double degradation = computeWireSlewDegradation(cell_info.output.pin, sink_pin);
+            double effective_limit = (double)sink_slew_limit - degradation;
+            min_sink_limit = std::min(min_sink_limit, effective_limit);
           }
         }
       }
       
-      // If no explicit constraints found, use technology-appropriate defaults
-      if (!found_constraint) {
-        // Use more conservative default based on fanout
-        int fanout = cell_info.output.sinks.size();
-        if (fanout == 0) {
-          min_sink_limit = default_max_slew_ * 0.5; // Tighter for outputs
-        } else if (fanout <= 4) {
-          min_sink_limit = default_max_slew_ * 0.6; // Normal fanout
-        } else {
-          min_sink_limit = default_max_slew_ * 0.8; // High fanout, relax slightly
-        }
+      if (!any_sink_has_limit) {
+        // No explicit constraints found - use technology default
+        min_sink_limit = default_max_slew_;
       }
       
-      // Account for wire degradation more realistically
-      double load_cap = resizer_->graph_delay_calc_->loadCap(cell_info.output.pin, dcalc_ap_);
-      double wire_degradation = load_cap * 1e12 * wire_slew_degrade_factor_; // Convert to ps
-      double initial_target = min_sink_limit - wire_degradation * 1e-12; // Convert back to seconds
+      // Store the computed limit
+      cell_info.output.slew_limit_from_sinks = min_sink_limit;
       
-      // More conservative bounds
-      initial_target = max(initial_target, default_min_slew_);
-      initial_target = min(initial_target, min_sink_limit * 0.9); // Stay below limit
-      
-      cell_info.output.slew_target = initial_target;
+      // Initialize slew target to meet the tightest sink constraint
+      cell_info.output.slew_target = std::max(min_sink_limit, default_min_slew_);
+      cell_info.output.slew_target = std::min(cell_info.output.slew_target, default_max_slew_);
     }
   }
 }
 
 void HeldGateSizing::assignCellsToMeetSlewTargets() {
-  // Process cells in reverse topological order (as in Held's algorithm)
+  // Held's specification: "Cells are assigned to the smallest equivalent library cell 
+  // such that the slew targets at all output pins are met"
+  
   int cells_changed = 0;
-  int total_cells_processed = 0;
-  int cells_with_variants = 0;
+  int cells_processed = 0;
   
-  // Get current worst slack for prioritization
-  double current_wns = sta_->worstSlack(MinMax::max());
-  
+  // Process cells in decreasing longest distance from registers
   for (auto it = topo_sorted_cells_.rbegin(); it != topo_sorted_cells_.rend(); ++it) {
     HeldCellInfo* cell_info = *it;
-    total_cells_processed++;
+    cells_processed++;
     
-    if (cell_info->is_fixed) {
+    if (cell_info->is_fixed || !cell_info->output.pin) {
       continue; // Skip fixed cells (registers)
     }
-
-    Pin* output_pin = cell_info->output.pin;
-    if (!output_pin || cell_info->variants.empty()) continue;
     
-    if (cell_info->variants.size() > 1) {
-      cells_with_variants++;
-    }
-    
-    // Calculate current load capacitance
-    double load_cap = resizer_->graph_delay_calc_->loadCap(output_pin, dcalc_ap_);
-    cell_info->output.downstream_cap = load_cap;
-    
-    // Skip if no variants to choose from
     if (cell_info->variants.size() <= 1) {
+      // Even single variants need verification
+      if (cell_info->variants.size() == 1) {
+        // Check if current single variant meets slew target
+        double load_cap = resizer_->graph_delay_calc_->loadCap(cell_info->output.pin, dcalc_ap_);
+        double input_slew = estimateInputSlew(cell_info->input_pins);
+        double output_slew = computeOutputSlew(cell_info->variants[0], input_slew, load_cap);
+        
+        if (output_slew > cell_info->output.slew_target) {
+          // Single variant violates target - will be addressed in next iteration
+          logger_->warn(RSZ, 130, "Single variant violates slew target, will refine");
+        }
+      }
       continue;
     }
     
-    // Get current slack for this pin
-    double pin_slack = sta_->pinSlack(output_pin, MinMax::max());
+    // Calculate current load capacitance and input slew
+    double load_cap = resizer_->graph_delay_calc_->loadCap(cell_info->output.pin, dcalc_ap_);
+    cell_info->output.downstream_cap = load_cap;
+    double input_slew = estimateInputSlew(cell_info->input_pins);
     
-    // Estimate input slew more accurately
-    double input_slew = estimateInputSlew(cell_info->input_pins.empty() ? nullptr : cell_info->input_pins[0]);
-    
-    // Find the best variant considering both timing and slew targets
-    int best_idx = cell_info->current_variant_idx;
-    double best_score = numeric_limits<double>::infinity();
+    // Find smallest variant that meets slew target and capacitance limits
+    int best_variant_idx = -1;
     
     for (size_t i = 0; i < cell_info->variants.size(); ++i) {
       LibertyCell* variant = cell_info->variants[i];
       
+      // Check capacitance limits first
+      if (!checkCapacitanceLimits(variant, load_cap)) {
+        continue;
+      }
+      
       // Compute output slew for this variant
       double output_slew = computeOutputSlew(variant, input_slew, load_cap);
       
-      // Estimate delay improvement (simplified)
-      double area_ratio = variant->area() / cell_info->variants[cell_info->current_variant_idx]->area();
-      double delay_estimate = input_slew * 0.5 + load_cap * 1e12 / area_ratio; // Simplified delay model
-      
-      // Multi-objective scoring:
-      // 1. Slew target satisfaction
-      double slew_error = abs(output_slew - cell_info->output.slew_target);
-      
-      // 2. Timing criticality consideration - be more conservative
-      double timing_weight = 1.0;
-      if (pin_slack < 0) {
-        // Critical path - heavily prioritize timing improvement
-        timing_weight = (area_ratio > 1.0) ? 50.0 : 1.0; // Favor upsizing on critical paths
-      } else if (pin_slack > abs(current_wns) * 0.2) {
-        // Non-critical path - allow area optimization
-        timing_weight = (area_ratio < 1.0) ? 0.5 : 10.0; // Favor downsizing on non-critical paths
-      } else {
-        // Marginal slack - be very conservative
-        timing_weight = 100.0; // Discourage changes
-      }
-      
-      // 3. Area penalty/benefit
-      double area_factor = 1.0;
-      if (pin_slack < 0) {
-        // Critical: prefer larger cells (lower resistance)
-        area_factor = 1.0 / sqrt(area_ratio);
-      } else {
-        // Non-critical: prefer smaller cells (save area)
-        area_factor = sqrt(area_ratio);
-      }
-      
-      // Combined score (lower is better)
-      double score = slew_error * timing_weight + delay_estimate * 0.01 + area_factor * 0.1;
-      
-      if (score < best_score) {
-        best_score = score;
-        best_idx = i;
+      // Check if this variant meets the slew target
+      if (output_slew <= cell_info->output.slew_target) {
+        best_variant_idx = i;
+        break; // Take the first (smallest) variant that meets target
       }
     }
     
-    // Only apply changes that seem beneficial and aren't too risky
-    if (best_idx != cell_info->current_variant_idx) {
-      LibertyCell* best_cell = cell_info->variants[best_idx];
-      LibertyCell* current_cell = network_->libertyCell(cell_info->instance);
+    // Apply the change if we found a valid variant different from current
+    if (best_variant_idx >= 0 && best_variant_idx != cell_info->current_variant_idx) {
+      LibertyCell* best_cell = cell_info->variants[best_variant_idx];
       
-      // Additional safety check: don't make dramatic changes on critical paths
-      if (pin_slack < 0) {
-        double size_change = best_cell->area() / current_cell->area();
-        if (size_change < 0.7 || size_change > 2.0) {
-          continue; // Skip dramatic size changes on critical paths
-        }
-      }
-      
-      if (best_cell != current_cell) {
-        if (resizer_->replaceCell(cell_info->instance, best_cell, true)) {
-          cell_info->current_variant_idx = best_idx;
-          cells_changed++;
-        }
+      if (resizer_->replaceCell(cell_info->instance, best_cell, true)) {
+        cell_info->current_variant_idx = best_variant_idx;
+        cells_changed++;
       }
     }
+    // If no variant meets the target, leave unchanged (Held: "left to next global iteration")
   }
   
-  if (iteration_ <= 3) {  // Debug for first few iterations
-    logger_->info(RSZ, 127, "Assignment phase: processed {} cells, {} with variants, changed {} cells", 
-                 total_cells_processed, cells_with_variants, cells_changed);
-  }
+  logger_->info(RSZ, 127, "Assignment: processed {} cells, changed {} cells", 
+                cells_processed, cells_changed);
 }
 
 void HeldGateSizing::performTimingAnalysis() {
-  // Use OpenROAD's STA to update timing
-  sta_->findDelays();
+  // Held's "Timing analysis" - complete STA with forward and backward passes
+  sta_->findDelays();      // Forward pass: compute arrival times
+  sta_->findRequireds();   // Backward pass: compute required times
   
   // Update our data structures with timing results
   endpoints_count_ = 0;
@@ -483,23 +506,32 @@ void HeldGateSizing::performTimingAnalysis() {
     if (cell_info.output.pin) {
       Pin* pin = cell_info.output.pin;
       
-      // Get arrival and required times
+      // Get timing values from STA
+      cell_info.output.arrival_time = sta_->pinArrival(pin, RiseFall::rise(), MinMax::max());
+      
       sta::Vertex* vertex = resizer_->graph_->pinDrvrVertex(pin);
       if (vertex) {
-        cell_info.output.arrival_time = sta_->pinArrival(pin, RiseFall::rise(), 
-                                                        MinMax::max());
-        cell_info.output.required_time = sta_->vertexRequired(vertex, RiseFall::rise(),
-                                                          MinMax::max());
-        cell_info.output.slack = cell_info.output.required_time - 
-                                cell_info.output.arrival_time;
-        
-        // Get actual slew
-        cell_info.output.slew_actual = sta_->vertexSlew(vertex, RiseFall::rise(),
-                                                        MinMax::max());
+        cell_info.output.required_time = sta_->vertexRequired(vertex, RiseFall::rise(), MinMax::max());
+        cell_info.output.slack = cell_info.output.required_time - cell_info.output.arrival_time;
+        cell_info.output.slew_actual = sta_->vertexSlew(vertex, RiseFall::rise(), MinMax::max());
       }
       
       // Count endpoints (register inputs or primary outputs)
-      if (cell_info.is_fixed || cell_info.output.sinks.empty()) {
+      bool is_endpoint = false;
+      if (cell_info.output.sinks.empty()) {
+        is_endpoint = true; // Primary output
+      } else {
+        // Check if any sink is a register input
+        for (Pin* sink_pin : cell_info.output.sinks) {
+          Instance* sink_inst = network_->instance(sink_pin);
+          LibertyCell* sink_cell = network_->libertyCell(sink_inst);
+          if (sink_cell && sink_cell->hasSequentials()) {
+            is_endpoint = true;
+            break;
+          }
+        }
+      }
+      if (is_endpoint) {
         endpoints_count_++;
       }
     }
@@ -507,80 +539,80 @@ void HeldGateSizing::performTimingAnalysis() {
 }
 
 void HeldGateSizing::refineSlewTargets() {
-  // More aggressive slew target refinement based on timing criticality
-  int target_changes = 0;
-  double total_delta = 0.0;
+  // Held's Algorithm 2: Refine slew targets
   
-  // Get current worst slack to drive the algorithm
-  double current_wns = sta_->worstSlack(MinMax::max());
-  if (current_wns >= 0) current_wns = -1e-12; // Avoid division by zero
+  // Algorithm 2, Line 1: θ_k ← 1 / log(k + const)
+  double theta_k = 1.0 / log(iteration_ + log_constant_);
+  
+  int targets_changed = 0;
   
   for (auto& [inst, cell_info] : cell_info_map_) {
     if (!cell_info.output.pin) continue;
     
-    double old_target = cell_info.output.slew_target;
-    
-    // Get current slack for this pin directly from STA
-    double pin_slack = sta_->pinSlack(cell_info.output.pin, MinMax::max());
-    
-    // More aggressive adjustment based on criticality
-    double delta = 0.0;
-    
-    if (pin_slack < 0) {
-      // Critical path - tighten slew target aggressively to improve timing
-      double criticality = abs(pin_slack) / abs(current_wns);  // 0 to 1+
-      criticality = min(criticality, 2.0); // Cap at 2x worst slack
-      
-      // More aggressive scaling for critical paths
-      double aggressiveness = (iteration_ <= 2) ? 1.0 : (0.8 / log(iteration_));
-      aggressiveness = max(0.3, min(1.0, aggressiveness));
-      
-      // Tighten slew target significantly on critical paths
-      delta = -gamma_ * criticality * aggressiveness * max_change_ * 2.0;
-      
-    } else if (pin_slack > abs(current_wns) * 0.1) {
-      // Non-critical path with decent slack - relax slew target to save area
-      double slack_margin = min(pin_slack / abs(current_wns), 3.0);
-      
-      // Less aggressive relaxation
-      double relax_factor = (iteration_ <= 2) ? 0.5 : (0.3 / log(iteration_));
-      relax_factor = max(0.1, min(0.5, relax_factor));
-      
-      // Relax slew target on non-critical paths
-      delta = gamma_ * slack_margin * relax_factor * max_change_;
+    // Algorithm 2, Line 2: slk^-(c) ← min{slack(p') | p' ∈ preds of c}
+    double slk_minus = std::numeric_limits<double>::infinity();
+    for (Instance* pred_inst : cell_preds_[inst]) {
+      auto pred_it = cell_info_map_.find(pred_inst);
+      if (pred_it != cell_info_map_.end() && pred_it->second.output.pin) {
+        double pred_slack = sta_->pinSlack(pred_it->second.output.pin, MinMax::max());
+        slk_minus = std::min(slk_minus, pred_slack);
+      }
     }
-    // For slightly critical paths (small positive slack), don't change much
-    
-    // Update slew target with bounds checking
-    double new_target = cell_info.output.slew_target + delta;
-    
-    // More realistic bounds based on technology (tighter range for better control)
-    double min_practical = default_min_slew_;
-    double max_practical = default_max_slew_ * 0.8; // Tighter upper bound
-    
-    // Clamp to practical range
-    new_target = max(new_target, min_practical);
-    new_target = min(new_target, max_practical);
-    
-    cell_info.output.slew_target = new_target;
-    
-    if (abs(new_target - old_target) > 1e-15) {
-      target_changes++;
-      total_delta += abs(new_target - old_target);
+    if (slk_minus == std::numeric_limits<double>::infinity()) {
+      slk_minus = 0.0; // No predecessors
     }
+    cell_info.slack_minus = slk_minus;
+    
+    // Algorithm 2, Lines 3-14: For all p ∈ Pout(c)
+    Pin* output_pin = cell_info.output.pin;
+    
+    // Algorithm 2, Line 4: slk^+(p) ← slack(p)
+    double slk_plus = sta_->pinSlack(output_pin, MinMax::max());
+    
+    // Algorithm 2, Line 5: lc(p) ← max{slk^+(p) - slk^-(c), 0}
+    double lc = std::max(slk_plus - slk_minus, 0.0);
+    
+    double delta_slew_target = 0.0;
+    
+    // Algorithm 2, Lines 6-11: Conditional logic
+    if (slk_plus < 0.0 && lc == 0.0) {
+      // Algorithm 2, Line 7: Δslewt ← -min{θ_k·γ·|slk^+(p)|, max_change}
+      delta_slew_target = -std::min(theta_k * gamma_ * std::abs(slk_plus), max_change_);
+    } else {
+      // Algorithm 2, Line 9: slk^+(p) ← max{slk^+(p), lc(p)}
+      slk_plus = std::max(slk_plus, lc);
+      // Algorithm 2, Line 10: Δslewt ← +min{θ_k·γ·|slk^+(p)|, max_change}
+      delta_slew_target = +std::min(theta_k * gamma_ * std::abs(slk_plus), max_change_);
+    }
+    
+    // Algorithm 2, Line 12: slewt(p) ← slewt(p) + Δslewt
+    double new_slew_target = cell_info.output.slew_target + delta_slew_target;
+    
+    // Algorithm 2, Line 13: Project slewt(p) into [slewt_min([p]), slewlim(p)]
+    // Compute bounds for this specific cell
+    double load_cap = resizer_->graph_delay_calc_->loadCap(output_pin, dcalc_ap_);
+    double input_slew = estimateInputSlew(cell_info.input_pins);
+    double slew_min = computeMinAchievableSlew(&cell_info, load_cap, input_slew);
+    double slew_max = cell_info.output.slew_limit_from_sinks;
+    
+    // Clamp to bounds
+    new_slew_target = std::max(slew_min, std::min(new_slew_target, slew_max));
+    
+    if (std::abs(new_slew_target - cell_info.output.slew_target) > 1e-15) {
+      targets_changed++;
+    }
+    
+    cell_info.output.slew_target = new_slew_target;
   }
   
-  if (iteration_ <= 3) {  // Debug for first few iterations
-    logger_->info(RSZ, 128, "Refinement phase: {} targets changed, avg delta: {:.3e} s, WNS: {:.3f} ps",
-                 target_changes, target_changes > 0 ? total_delta/target_changes : 0.0,
-                 current_wns * 1e12);
-  }
+  logger_->info(RSZ, 128, "Refinement: θ_k={:.3f}, {} targets changed", 
+                theta_k, targets_changed);
 }
 
 double HeldGateSizing::computeOutputSlew(LibertyCell* cell,
                                         double input_slew,
                                         double load_cap) {
-  // Use OpenROAD's existing gate delay calculation infrastructure
+  // Find output port
   LibertyPort* output_port = nullptr;
   sta::LibertyCellPortIterator port_iter(cell);
   while (port_iter.hasNext()) {
@@ -598,72 +630,125 @@ double HeldGateSizing::computeOutputSlew(LibertyCell* cell,
   Slew slews[RiseFall::index_count];
   resizer_->gateDelays(output_port, load_cap, dcalc_ap_, delays, slews);
   
-  return max(slews[RiseFall::riseIndex()], slews[RiseFall::fallIndex()]);
+  return std::max(slews[RiseFall::riseIndex()], slews[RiseFall::fallIndex()]);
 }
 
-double HeldGateSizing::estimateInputSlew(Pin* input_pin) {
-  if (!input_pin) {
-    // Use worst case among all input pins if none specified
-    double worst_slew = default_input_slew_;
-    for (auto& [inst, cell_info] : cell_info_map_) {
-      for (Pin* pin : cell_info.input_pins) {
-        sta::Vertex* vertex = resizer_->graph_->pinLoadVertex(pin);
-        if (vertex) {
-          double pin_slew = sta_->vertexSlew(vertex, RiseFall::rise(), MinMax::max());
-          worst_slew = max(worst_slew, pin_slew);
-        }
-      }
-    }
-    return worst_slew;
+double HeldGateSizing::estimateInputSlew(const std::vector<Pin*>& input_pins) {
+  // Held's specification: "Input slews are estimated from predecessor targets by:
+  // est_slew(p') := θ·slewt(p') + (1-θ)·slew(p')"
+  
+  if (input_pins.empty()) {
+    return default_input_slew_;
   }
   
-  // Find driving pin and use its actual slew
-  Pin* driving_pin = nullptr;
-  PinConnectedPinIterator* conn_iter = this->network_->connectedPinIterator(input_pin);
-  while (conn_iter->hasNext()) {
-    const Pin* conn_pin = conn_iter->next();
-    if (conn_pin != input_pin && this->network_->direction(conn_pin)->isOutput()) {
-      driving_pin = const_cast<Pin*>(conn_pin);
+  double theta_k = 1.0 / log(iteration_ + log_constant_);
+  double worst_input_slew = default_input_slew_;
+  
+  for (Pin* input_pin : input_pins) {
+    // Find driving pin
+    Pin* driving_pin = nullptr;
+    PinConnectedPinIterator* conn_iter = network_->connectedPinIterator(input_pin);
+    while (conn_iter->hasNext()) {
+      const Pin* conn_pin = conn_iter->next();
+      if (conn_pin != input_pin && network_->direction(conn_pin)->isOutput()) {
+        driving_pin = const_cast<Pin*>(conn_pin);
+        break;
+      }
+    }
+    delete conn_iter;
+    
+    if (driving_pin) {
+      // Get actual slew from STA
+      sta::Vertex* drvr_vertex = resizer_->graph_->pinDrvrVertex(driving_pin);
+      double actual_slew = default_input_slew_;
+      double target_slew = default_input_slew_;
+      
+      if (drvr_vertex) {
+        actual_slew = sta_->vertexSlew(drvr_vertex, RiseFall::rise(), MinMax::max());
+      }
+      
+      // Find target slew from our cell info map
+      Instance* driving_inst = network_->instance(driving_pin);
+      auto it = cell_info_map_.find(driving_inst);
+      if (it != cell_info_map_.end()) {
+        target_slew = it->second.output.slew_target;
+      }
+      
+      // Apply Held's mixing formula
+      double est_slew = theta_k * target_slew + (1.0 - theta_k) * actual_slew;
+      
+      // Add wire degradation
+      double wire_degradation = computeWireSlewDegradation(driving_pin, input_pin);
+      est_slew += wire_degradation;
+      
+      worst_input_slew = std::max(worst_input_slew, est_slew);
+    }
+  }
+  
+  return worst_input_slew;
+}
+
+double HeldGateSizing::computeWireSlewDegradation(Pin* driver_pin, Pin* sink_pin) {
+  // Use OpenROAD's existing infrastructure for wire slew degradation
+  // This is a simplified model - could be enhanced with actual RC calculation
+  Net* net = network_->net(driver_pin);
+  if (!net) return 0.0;
+  
+  // Use wire capacitance as proxy for RC delay degradation
+  double total_cap = resizer_->graph_delay_calc_->loadCap(driver_pin, dcalc_ap_);
+  
+  // Simplified RC model: degradation proportional to wire capacitance
+  // Use a conservative estimate of wire capacitance contribution
+  double estimated_wire_cap = total_cap * 0.1; // Assume 10% of load is wire
+  return estimated_wire_cap * 1e11; // Convert to reasonable slew degradation (empirical factor)
+}
+
+double HeldGateSizing::computeMinAchievableSlew(HeldCellInfo* cell_info, 
+                                               double load_cap, 
+                                               double input_slew) {
+  if (cell_info->variants.empty()) return default_min_slew_;
+  
+  // Find minimum slew achievable by the largest (strongest) variant
+  LibertyCell* largest_variant = cell_info->variants.back(); // Sorted by area, so last is largest
+  return computeOutputSlew(largest_variant, input_slew, load_cap);
+}
+
+double HeldGateSizing::computeSlewLimitFromSinks(HeldCellInfo* cell_info) {
+  // Recompute the slew limit based on current sink constraints
+  return cell_info->output.slew_limit_from_sinks; // Already computed in initialization
+}
+
+bool HeldGateSizing::checkCapacitanceLimits(LibertyCell* cell, double load_cap) {
+  // Check if the cell can drive the given load capacitance
+  // Find output port and check its capacitance limit
+  LibertyPort* output_port = nullptr;
+  sta::LibertyCellPortIterator port_iter(cell);
+  while (port_iter.hasNext()) {
+    LibertyPort* port = port_iter.next();
+    if (port->direction()->isOutput()) {
+      output_port = port;
       break;
     }
   }
-  delete conn_iter;
   
-  if (driving_pin) {
-    // Get actual slew from STA
-    sta::Vertex* drvr_vertex = resizer_->graph_->pinDrvrVertex(driving_pin);
-    if (drvr_vertex) {
-      double actual_slew = sta_->vertexSlew(drvr_vertex, RiseFall::rise(), MinMax::max());
-      
-      // If we have cell info for the driving instance, use mix of target and actual
-      Instance* driving_inst = this->network_->instance(driving_pin);
-      auto it = cell_info_map_.find(driving_inst);
-      if (it != cell_info_map_.end()) {
-        // Weight actual slew more heavily in later iterations
-        double actual_weight = (iteration_ <= 1) ? 0.3 : min(0.8, 0.3 + iteration_ * 0.1);
-        double target_weight = 1.0 - actual_weight;
-        return actual_weight * actual_slew + target_weight * it->second.output.slew_target;
-      } else {
-        // Just use actual slew if we don't track this cell
-        return actual_slew;
-      }
-    }
+  if (!output_port) return false;
+  
+  // Check capacitance limit
+  float cap_limit;
+  bool exists;
+  output_port->capacitanceLimit(MinMax::max(), cap_limit, exists);
+  if (exists && load_cap > cap_limit) {
+    return false;
   }
   
-  return default_input_slew_;
-}
-
-double HeldGateSizing::computeSlack(Pin* pin) {
-  return this->sta_->pinSlack(pin, MinMax::max());
+  return true;
 }
 
 double HeldGateSizing::computeWorstSlack() {
-  // Use OpenROAD's STA to get the actual worst slack
   return sta_->worstSlack(MinMax::max());
 }
 
 double HeldGateSizing::computeTotalNegativeSlack() {
-  // Use OpenROAD's STA to get the actual total negative slack
   return sta_->totalNegativeSlack(MinMax::max());
 }
 
@@ -672,7 +757,7 @@ double HeldGateSizing::computeAverageCellArea() {
   
   double total_area = 0.0;
   for (const auto& [inst, cell_info] : cell_info_map_) {
-    LibertyCell* cell = this->network_->libertyCell(inst);
+    LibertyCell* cell = network_->libertyCell(inst);
     if (cell) {
       total_area += cell->area();
     }
@@ -681,31 +766,25 @@ double HeldGateSizing::computeAverageCellArea() {
   return total_area / cell_info_map_.size();
 }
 
-double HeldGateSizing::computeObjective() {
-  double wns = computeWorstSlack();
-  double tns = computeTotalNegativeSlack();
+double HeldGateSizing::computeHeldObjective() {
+  // Held's objective: WS + SNS + avg_area
+  double ws = std::abs(computeWorstSlack());
+  double sns = computeTotalNegativeSlack() / std::max(1.0, (double)endpoints_count_);
   double avg_area = computeAverageCellArea();
   
-  // Normalize metrics for better balance
-  double base_area = 1.0; // Assume base area of 1.0 as reference
-  double area_ratio = avg_area / base_area;
+  return ws + sns + avg_area;
+}
+
+bool HeldGateSizing::checkHeldStoppingCriterion(double prev_ws, double prev_sns, double prev_area) {
+  // Held's stopping criterion: if WS worsened AND overall objective worsened
+  double curr_ws = std::abs(computeWorstSlack());
+  double curr_sns = computeTotalNegativeSlack() / std::max(1.0, (double)endpoints_count_);
+  double curr_area = computeAverageCellArea();
   
-  // Timing-focused objective with area penalty
-  if (wns < 0) {
-    // When timing is violated, heavily weight timing
-    // WNS in ps (absolute value), TNS normalized by endpoint count
-    double wns_ps = abs(wns * 1e12);
-    double tns_per_endpoint = (endpoints_count_ > 0) ? abs(tns * 1e12) / endpoints_count_ : 0.0;
-    
-    // Primary objective: fix timing violations
-    // Secondary objective: minimize area growth
-    return wns_ps * 100.0 + tns_per_endpoint * 10.0 + area_ratio * 1.0;
-  } else {
-    // When timing is met, focus on area optimization
-    // Small timing bonus to maintain positive slack
-    double slack_bonus = min(wns * 1e12, 100.0); // Cap bonus at 100ps
-    return area_ratio * 100.0 - slack_bonus;
-  }
+  bool ws_worsened = curr_ws > prev_ws;
+  bool obj_worsened = (curr_ws + curr_sns + curr_area) > (prev_ws + prev_sns + prev_area);
+  
+  return ws_worsened && obj_worsened;
 }
 
 void HeldGateSizing::saveCurrentAssignmentAsBest() {
@@ -723,7 +802,7 @@ void HeldGateSizing::restoreBestAssignment() {
       if (best_idx != cell_info.current_variant_idx && 
           best_idx < (int)cell_info.variants.size()) {
         LibertyCell* best_cell = cell_info.variants[best_idx];
-        LibertyCell* current_cell = this->network_->libertyCell(inst);
+        LibertyCell* current_cell = network_->libertyCell(inst);
         if (best_cell != current_cell) {
           resizer_->replaceCell(inst, best_cell, true);
           cell_info.current_variant_idx = best_idx;
@@ -732,7 +811,7 @@ void HeldGateSizing::restoreBestAssignment() {
     }
   }
   
-  // Rerun timing analysis
+  // Rerun timing analysis after restoration
   performTimingAnalysis();
 }
 

@@ -76,10 +76,6 @@ set_wire_rc -signal -layer $wire_rc_layer
 set_wire_rc -clock  -layer $wire_rc_layer_clk
 set_dont_use $dont_use
 
-estimate_parasitics -placement
-
-repair_design -slew_margin $slew_margin -cap_margin $cap_margin
-
 repair_tie_fanout -separation $tie_separation $tielo_port
 repair_tie_fanout -separation $tie_separation $tiehi_port
 
@@ -99,9 +95,9 @@ utl::metric "RSZ::max_fanout_slack" [expr [sta::max_fanout_check_slack_limit] * 
 utl::metric "RSZ::max_capacitance_slack" [expr [sta::max_capacitance_check_slack_limit] * 100]
 
 ################################################################
-# HELD ALGORITHM GATE SIZING
+# HELD ALGORITHM GATE SIZING (Pre-CTS)
 
-puts "\n=== Applying Held Gate Sizing Algorithm ==="
+puts "\n=== Applying Held Gate Sizing Algorithm (Pre-CTS) ==="
 
 # Get baseline metrics before Held optimization
 set baseline_wns [sta::worst_slack -max]
@@ -113,7 +109,18 @@ puts [format "  WNS: %.3f ns" $baseline_wns]
 puts [format "  TNS: %.3f ns" $baseline_tns]
 puts [format "  Area: %.1f um²" [expr $baseline_area * 1e12]]
 
-# Apply Held optimization
+# Verify Held parameters are defined
+if {![info exists held_gamma]} {
+    error "held_gamma is not defined"
+}
+if {![info exists held_max_change]} {
+    error "held_max_change is not defined"
+}
+if {![info exists held_iterations]} {
+    error "held_iterations is not defined"
+}
+
+# Apply Held optimization (Pre-CTS under ideal clocks)
 puts "\nApplying Held gate sizing with parameters:"
 puts "  γ (gamma): $held_gamma"
 puts "  Max change: $held_max_change"
@@ -129,46 +136,57 @@ if {[llength $clocks] > 0} {
 }
 
 # Set Held parameters and run optimization
-if {[catch {::rsz::set_held_sizing_parameters_cmd $held_gamma $held_max_change $held_iterations} result]} {
+set held_pre_cts_runtime 0
+
+if {[catch {set_held_sizing_parameters_cmd $held_gamma $held_max_change $held_iterations} result]} {
     puts "Warning: Could not set Held parameters: $result"
-    puts "Using default gate sizing instead"
-    set held_runtime 0
+    puts "Skipping Held algorithm and continuing with flow"
 } else {
     # Held algorithm timing measurement - START
-    puts "=== Starting Held Gate Sizing Algorithm ==="
-    set held_start_time [clock seconds]
-    set clock_period_seconds [expr $clock_period * 1e-9]
-    if {[catch {::rsz::optimize_gate_sizing_held_cmd \
-        $clock_period_seconds $held_gamma $held_max_change $held_iterations} held_success]} {
+    puts "=== Starting Held Gate Sizing Algorithm (Pre-CTS) ==="
+    set held_pre_cts_start_time 0
+    catch {set held_pre_cts_start_time [clock seconds]}
+    
+    if {[catch {optimize_gate_sizing_held_cmd $clock_period} held_success]} {
         puts "Warning: Held optimization failed: $held_success"
-        puts "Using default gate sizing instead"
-        set held_runtime 0
+        puts "Continuing with flow without Pre-CTS gate sizing"
     } else {
         # Held algorithm timing measurement - END
-        set held_end_time [clock seconds]
-        set held_runtime [expr $held_end_time - $held_start_time]
-        puts "=== Held Gate Sizing Complete ==="
-        puts "Held gate sizing runtime: ${held_runtime} seconds"
+        set held_pre_cts_end_time 0
+        catch {set held_pre_cts_end_time [clock seconds]}
+        set held_pre_cts_runtime [expr $held_pre_cts_end_time - $held_pre_cts_start_time]
+        puts "=== Held Gate Sizing (Pre-CTS) Complete ==="
+        puts "Held gate sizing (Pre-CTS) runtime: ${held_pre_cts_runtime} seconds"
         
         # Re-estimate parasitics after Held optimization
         estimate_parasitics -placement
         
         # Get metrics after Held optimization
-        set held_wns [sta::worst_slack -max]
-        set held_tns [sta::total_negative_slack -max]
-        set held_area [rsz::design_area]
+        set held_pre_cts_wns [sta::worst_slack -max]
+        set held_pre_cts_tns [sta::total_negative_slack -max]
+        set held_pre_cts_area [rsz::design_area]
         
-        puts "\nHeld optimization results:"
-        puts "  Runtime: ${held_runtime}s"
-        puts [format "  WNS: %.3f ns (improvement: %+.3f ns)" $held_wns [expr $held_wns - $baseline_wns]]
-        puts [format "  TNS: %.3f ns (improvement: %+.3f ns)" $held_tns [expr $held_tns - $baseline_tns]]
-        puts [format "  Area: %.1f um² (increase: %+.1f%%)" [expr $held_area * 1e12] \
-            [expr ($held_area - $baseline_area) / $baseline_area * 100]]
+        puts "\nHeld optimization (Pre-CTS) results:"
+        puts "  Runtime: ${held_pre_cts_runtime}s"
+        puts [format "  WNS: %.3f ns (improvement: %+.3f ns)" $held_pre_cts_wns [expr $held_pre_cts_wns - $baseline_wns]]
+        puts [format "  TNS: %.3f ns (improvement: %+.3f ns)" $held_pre_cts_tns [expr $held_pre_cts_tns - $baseline_tns]]
+        puts [format "  Area: %.1f um² (increase: %+.1f%%)" [expr $held_pre_cts_area * 1e12] \
+            [expr ($held_pre_cts_area - $baseline_area) / $baseline_area * 100]]
+        
+        # Check if timing degraded significantly
+        set wns_degradation [expr $baseline_wns - $held_pre_cts_wns]
+        if {$wns_degradation > 0.1} {
+            puts "WARNING: WNS degraded by ${wns_degradation} ns - Held algorithm may need parameter adjustment"
+        }
     }
 }
 
 # Record Held runtime as metric for comparison
-utl::metric "HELD::gate_sizing_runtime" $held_runtime
+if {[info exists held_pre_cts_runtime]} {
+    utl::metric "HELD::pre_cts_gate_sizing_runtime" "$held_pre_cts_runtime"
+} else {
+    utl::metric "HELD::pre_cts_gate_sizing_runtime" "0"
+}
 
 ################################################################
 # Clock Tree Synthesis
@@ -192,7 +210,9 @@ set cts_db [make_result_file ${design}_${platform}_cts.db]
 write_db $cts_db
 
 ################################################################
-# Setup/hold timing repair
+# HELD ALGORITHM GATE SIZING (Post-CTS)
+
+puts "\n=== Applying Held Gate Sizing Algorithm (Post-CTS) ==="
 
 set_propagated_clock [all_clocks]
 
@@ -207,19 +227,76 @@ if { $repair_timing_use_grt_parasitics } {
   estimate_parasitics -placement
 }
 
-# Additional gate sizing timing measurement (after Held) - START
-puts "=== Starting Additional OpenROAD Gate Sizing (repair_timing) ==="
-set additional_gate_sizing_start_time [clock seconds]
+# Get baseline metrics before Post-CTS Held optimization
+set baseline_post_cts_wns [sta::worst_slack -max]
+set baseline_post_cts_tns [sta::total_negative_slack -max]
+set baseline_post_cts_area [rsz::design_area]
 
-repair_timing -skip_gate_cloning
+puts "Baseline metrics before Post-CTS Held optimization:"
+puts [format "  WNS: %.3f ns" $baseline_post_cts_wns]
+puts [format "  TNS: %.3f ns" $baseline_post_cts_tns]
+puts [format "  Area: %.1f um²" [expr $baseline_post_cts_area * 1e12]]
 
-# Additional gate sizing timing measurement (after Held) - END
-set additional_gate_sizing_end_time [clock seconds]
-set additional_gate_sizing_runtime [expr $additional_gate_sizing_end_time - $additional_gate_sizing_start_time]
-puts "=== Additional OpenROAD Gate Sizing Complete ==="
-puts "Additional gate sizing runtime: ${additional_gate_sizing_runtime} seconds"
+# Apply Held optimization again after CTS with real clock propagation
+puts "\nApplying Held gate sizing (Post-CTS) with parameters:"
+puts "  γ (gamma): $held_gamma"
+puts "  Max change: $held_max_change"
+puts "  Iterations: $held_iterations"
+puts "  Clock propagation: Real (after CTS)"
 
-# Post timing repair.
+# Held algorithm timing measurement (Post-CTS) - START
+puts "=== Starting Held Gate Sizing Algorithm (Post-CTS) ==="
+set held_post_cts_start_time 0
+catch {set held_post_cts_start_time [clock seconds]}
+set held_post_cts_runtime 0
+
+# Calculate clock period in seconds for Post-CTS optimization
+# set clock_period_seconds [expr $clock_period * 1e-9]
+
+# Set Held parameters for Post-CTS optimization
+if {[catch {set_held_sizing_parameters_cmd $held_gamma $held_max_change $held_iterations} result]} {
+    puts "Warning: Could not set Post-CTS Held parameters: $result"
+    puts "Skipping Post-CTS gate sizing"
+    set held_post_cts_runtime 0
+} else {
+    # Calculate clock period in seconds for the optimization call  
+    set clock_period_seconds [expr $clock_period * 1e-9]
+    
+    if {[catch {optimize_gate_sizing_held_cmd $clock_period_seconds} held_post_cts_success]} {
+        puts "Warning: Post-CTS Held optimization failed: $held_post_cts_success"
+        puts "Continuing without Post-CTS gate sizing"
+    } else {
+        # Held algorithm timing measurement (Post-CTS) - END
+        set held_post_cts_end_time 0
+        catch {set held_post_cts_end_time [clock seconds]}
+        set held_post_cts_runtime [expr $held_post_cts_end_time - $held_post_cts_start_time]
+        puts "=== Held Gate Sizing (Post-CTS) Complete ==="
+        puts "Held gate sizing (Post-CTS) runtime: ${held_post_cts_runtime} seconds"
+        
+        # Re-estimate parasitics after Post-CTS Held optimization
+        estimate_parasitics -placement
+        
+        # Get metrics after Post-CTS Held optimization
+        set held_post_cts_wns [sta::worst_slack -max]
+        set held_post_cts_tns [sta::total_negative_slack -max]
+        set held_post_cts_area [rsz::design_area]
+        
+        puts "\nHeld optimization (Post-CTS) results:"
+        puts "  Runtime: ${held_post_cts_runtime}s"
+        puts [format "  WNS: %.3f ns (improvement: %+.3f ns)" $held_post_cts_wns [expr $held_post_cts_wns - $baseline_post_cts_wns]]
+        puts [format "  TNS: %.3f ns (improvement: %+.3f ns)" $held_post_cts_tns [expr $held_post_cts_tns - $baseline_post_cts_tns]]
+        puts [format "  Area: %.1f um² (increase: %+.1f%%)" [expr $held_post_cts_area * 1e12] \
+            [expr ($held_post_cts_area - $baseline_post_cts_area) / $baseline_post_cts_area * 100]]
+        
+        # Check if timing degraded significantly
+        set wns_degradation [expr $baseline_post_cts_wns - $held_post_cts_wns]
+        if {$wns_degradation > 0.1} {
+            puts "WARNING: Post-CTS WNS degraded by ${wns_degradation} ns - Held algorithm may need parameter adjustment"
+        }
+    }
+}
+
+# Post timing optimization using Held algorithm only
 report_worst_slack -min -digits 3
 report_worst_slack -max -digits 3
 report_tns -digits 3
@@ -228,8 +305,14 @@ report_check_types -max_slew -max_capacitance -max_fanout -violators -digits 3
 utl::metric "RSZ::worst_slack_min" [sta::worst_slack -min]
 utl::metric "RSZ::worst_slack_max" [sta::worst_slack -max]
 utl::metric "RSZ::tns_max" [sta::total_negative_slack -max]
-utl::metric "RSZ::hold_buffer_count" [rsz::hold_buffer_count]
-utl::metric "HELD::additional_gate_sizing_runtime" $additional_gate_sizing_runtime
+utl::metric "RSZ::hold_buffer_count" 0
+if {[info exists held_post_cts_runtime]} {
+    utl::metric "HELD::post_cts_gate_sizing_runtime" "$held_post_cts_runtime"
+} else {
+    utl::metric "HELD::post_cts_gate_sizing_runtime" "0"
+}
+
+puts "\n=== All Gate Sizing Completed Using Held Algorithm ==="
 
 ################################################################
 # Detailed Placement
@@ -238,7 +321,8 @@ detailed_placement
 
 # Capture utilization before fillers make it 100%
 utl::metric "DPL::utilization" [format %.1f [expr [rsz::utilization] * 100]]
-utl::metric "DPL::design_area" [sta::format_area [rsz::design_area] 0]
+set design_area_formatted [sta::format_area [rsz::design_area] 0]
+utl::metric "DPL::design_area" "$design_area_formatted"
 
 # checkpoint
 set dpl_db [make_result_file ${design}_${platform}_dpl.db]
@@ -287,7 +371,7 @@ detailed_route -output_drc [make_result_file "${design}_${platform}_route_drc.rp
 
 write_guides [make_result_file "${design}_${platform}_output_guide.mod"]
 set drv_count [detailed_route_num_drvs]
-utl::metric "DRT::drv" $drv_count
+utl::metric "DRT::drv" "$drv_count"
 
 set routed_db [make_result_file ${design}_${platform}_route.db]
 write_db $routed_db
@@ -379,6 +463,12 @@ utl::metric "DRT::max_slew_slack" [expr [sta::max_slew_check_slack_limit] * 100]
 utl::metric "DRT::max_fanout_slack" [expr [sta::max_fanout_check_slack_limit] * 100]
 utl::metric "DRT::max_capacitance_slack" [expr [sta::max_capacitance_check_slack_limit] * 100];
 # report clock period as a metric for updating limits
-utl::metric "DRT::clock_period" [get_property [lindex [all_clocks] 0] period]
+set clocks_list [all_clocks]
+if {[llength $clocks_list] > 0} {
+    set clock_period_final [get_property [lindex $clocks_list 0] period]
+    utl::metric "DRT::clock_period" "$clock_period_final"
+} else {
+    utl::metric "DRT::clock_period" "0.0"
+}
 
 puts "\n=== Physical Design Flow with Held Algorithm Complete ===" 
